@@ -1,103 +1,103 @@
-// util.ts — small shared helpers: git object ids, pkt-lines, base64url, time.
-// Written fresh for this entry.
+// util.ts — small shared helpers: object ids, packet framing, base64url,
+// and clock formatting. No behavior beyond what the other modules need.
 
 import { createHash } from 'node:crypto';
 
-export const ZERO_OID = '0000000000000000000000000000000000000000';
+export const NULL_OID = '0000000000000000000000000000000000000000';
 
-export function sha1Hex(data: Buffer | string): string {
+export function sha1Digest(data: Buffer | string): string {
   return createHash('sha1').update(data).digest('hex');
 }
 
-/** The git object id of `type` + data: sha1("<type> <len>\0" + data). */
-export function hashObject(type: string, data: Buffer): string {
-  const head = Buffer.from(type + ' ' + data.length + '\0', 'ascii');
-  return createHash('sha1').update(head).update(data).digest('hex');
+/** The git object id of a typed blob: sha1("<type> <length>\0" + data). */
+export function objectIdFor(kind: string, data: Buffer): string {
+  const prefix = Buffer.from(kind + ' ' + data.length + '\0', 'ascii');
+  return createHash('sha1').update(prefix).update(data).digest('hex');
 }
 
-export function b64urlEncode(s: string): string {
-  return Buffer.from(s, 'utf8').toString('base64url');
+export function encodeBase64Url(text: string): string {
+  return Buffer.from(text, 'utf8').toString('base64url');
 }
 
-export function b64urlDecode(s: string): string {
+export function decodeBase64Url(text: string): string {
   try {
-    return Buffer.from(s, 'base64url').toString('utf8');
+    return Buffer.from(text, 'base64url').toString('utf8');
   } catch {
     return '';
   }
 }
 
-/** ISO-8601 UTC timestamp for a unix-seconds value. */
-export function isoFromSec(sec: number): string {
-  return new Date(sec * 1000).toISOString();
+/** An ISO-8601 UTC timestamp for a unix-seconds value. */
+export function isoTimestamp(seconds: number): string {
+  return new Date(seconds * 1000).toISOString();
 }
 
-/** One pkt-line framing `payload` (4 hex digits of total length + payload). */
-export function pktLine(payload: Buffer | string): Buffer {
+/** Frame `payload` as one pkt-line: 4 hex digits of total length, then payload. */
+export function framePacket(payload: Buffer | string): Buffer {
   const body = typeof payload === 'string' ? Buffer.from(payload, 'utf8') : payload;
-  const out = Buffer.allocUnsafe(4 + body.length);
-  out.write((body.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
-  body.copy(out, 4);
-  return out;
+  const framed = Buffer.allocUnsafe(4 + body.length);
+  framed.write((body.length + 4).toString(16).padStart(4, '0'), 0, 4, 'ascii');
+  body.copy(framed, 4);
+  return framed;
 }
 
-export const PKT_FLUSH = Buffer.from('0000', 'ascii');
-export const PKT_DELIM = Buffer.from('0001', 'ascii');
+export const PACKET_FLUSH = Buffer.from('0000', 'ascii');
+export const PACKET_DELIM = Buffer.from('0001', 'ascii');
 
-/** Split a buffer of pkt-lines. A delim line comes back as the 1-byte buffer [1]. */
-export function parsePktLines(buf: Buffer, start = 0): { lines: Buffer[]; end: number; flush: boolean } {
+/** Split a buffer of pkt-lines. A delim line returns as the 1-byte buffer [1]. */
+export function splitPackets(buffer: Buffer, start = 0): { lines: Buffer[]; end: number; flush: boolean } {
   const lines: Buffer[] = [];
-  let i = start;
-  while (i + 4 <= buf.length) {
-    const len = parseInt(buf.subarray(i, i + 4).toString('ascii'), 16);
-    if (!Number.isFinite(len) || len < 0) break;
-    if (len === 0) return { lines, end: i + 4, flush: true };
-    if (len === 1) {
+  let cursor = start;
+  while (cursor + 4 <= buffer.length) {
+    const length = parseInt(buffer.subarray(cursor, cursor + 4).toString('ascii'), 16);
+    if (!Number.isFinite(length) || length < 0) break;
+    if (length === 0) return { lines, end: cursor + 4, flush: true };
+    if (length === 1) {
       lines.push(Buffer.from([1]));
-      i += 4;
+      cursor += 4;
       continue;
     }
-    if (i + len > buf.length) break;
-    lines.push(buf.subarray(i + 4, i + len));
-    i += len;
+    if (cursor + length > buffer.length) break;
+    lines.push(buffer.subarray(cursor + 4, cursor + length));
+    cursor += length;
   }
-  return { lines, end: i, flush: false };
+  return { lines, end: cursor, flush: false };
 }
 
-/** Wrap raw bytes into sideband band-1 pkt-lines (band byte + at most 65515 data bytes each). */
-export function sidebandPackets(data: Buffer): Buffer[] {
-  const out: Buffer[] = [];
-  let off = 0;
-  while (off < data.length) {
-    const chunk = data.subarray(off, Math.min(data.length, off + 65515));
-    const payload = Buffer.concat([Buffer.from([1]), chunk]);
-    out.push(pktLine(payload));
-    off += chunk.length;
+/** Wrap raw bytes into sideband band-1 pkt-lines: one band byte, then at most 65515 data bytes each. */
+export function wrapSideband(data: Buffer): Buffer[] {
+  const packets: Buffer[] = [];
+  let offset = 0;
+  while (offset < data.length) {
+    const slice = data.subarray(offset, Math.min(data.length, offset + 65515));
+    const payload = Buffer.concat([Buffer.from([1]), slice]);
+    packets.push(framePacket(payload));
+    offset += slice.length;
   }
-  return out;
+  return packets;
 }
 
-/** Extract the band-1 payloads from a sideband byte stream. */
-export function sidebandBand1(data: Buffer): Buffer {
+/** Pull the band-1 payloads back out of a sideband byte stream. */
+export function unwrapSideband(data: Buffer): Buffer {
   const chunks: Buffer[] = [];
-  let i = 0;
-  while (i + 4 <= data.length) {
-    const len = parseInt(data.subarray(i, i + 4).toString('ascii'), 16);
-    if (len === 0 || i + len > data.length) break;
-    const payload = data.subarray(i + 4, i + len);
+  let cursor = 0;
+  while (cursor + 4 <= data.length) {
+    const length = parseInt(data.subarray(cursor, cursor + 4).toString('ascii'), 16);
+    if (length === 0 || cursor + length > data.length) break;
+    const payload = data.subarray(cursor + 4, cursor + length);
     if (payload.length > 0 && payload[0] === 1) chunks.push(payload.subarray(1));
-    i += len;
+    cursor += length;
   }
   return Buffer.concat(chunks);
 }
 
-/** True when `s` is exactly 40 hex characters. */
-export function isHex40(s: string): boolean {
-  if (s.length !== 40) return false;
-  for (let i = 0; i < 40; i++) {
-    const c = s.charCodeAt(i);
-    const ok = (c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70);
-    if (!ok) return false;
+/** True when `text` is exactly 40 hexadecimal characters. */
+export function isFortyHex(text: string): boolean {
+  if (text.length !== 40) return false;
+  for (let idx = 0; idx < 40; idx++) {
+    const code = text.charCodeAt(idx);
+    const digit = (code >= 48 && code <= 57) || (code >= 97 && code <= 102) || (code >= 65 && code <= 70);
+    if (!digit) return false;
   }
   return true;
 }
